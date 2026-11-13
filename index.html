@@ -37,7 +37,11 @@
   --staff:#C8CBD6; color-scheme:dark;
 }
 html,body{height:100%}
-body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:16px;line-height:1.5;touch-action:manipulation;-webkit-text-size-adjust:100%}
+/* An app, not a page: no double-tap zoom, no text selection or callout on long press. The keyboard keeps touch-action:none. */
+*{touch-action:manipulation}
+body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:16px;line-height:1.5;-webkit-text-size-adjust:100%;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+input,textarea{-webkit-user-select:text;user-select:text}
+.mic-diag{display:block;margin-top:6px;font-size:13px;font-variant-numeric:tabular-nums;color:var(--muted)}
 #app{height:100%;display:flex;flex-direction:column}
 button{font:inherit;color:inherit;cursor:pointer;-webkit-tap-highlight-color:transparent}
 button:focus-visible,input:focus-visible{outline:3px solid var(--felt);outline-offset:2px}
@@ -366,9 +370,11 @@ const Audio={
   ctx:null, live:new Map(), sched:[],
   ensure(){
     if(!this.ctx){
-      try{ if(navigator.audioSession) navigator.audioSession.type="playback"; }catch(e){}
+      // Pick the iOS audio session before the context exists: switching it later can leave the context interrupted.
+      try{ const as=navigator.audioSession; if(as&&as.type!=="play-and-record") as.type=P.settings.mic?"play-and-record":"playback"; }catch(e){}
       const C=window.AudioContext||window.webkitAudioContext;
       const ctx=this.ctx=new C({latencyHint:"interactive"});
+      ctx.onstatechange=()=>{ if(ctx.state!=="running"&&ctx.state!=="closed"&&!document.hidden) ctx.resume().catch(()=>{}); Mic.notify(); };
       this.out=ctx.createGain(); this.out.gain.value=P.settings.volume;
       const comp=ctx.createDynamicsCompressor(); comp.threshold.value=-16; comp.ratio.value=4; comp.attack.value=.003; comp.release.value=.2;
       this.out.connect(comp); comp.connect(ctx.destination);
@@ -460,18 +466,27 @@ const Mic={
     if(this.on) return true;
     if(!this.supported()){ this.err="unsupported"; this.notify(); return false; }
     try{
+      // iOS: a context born in a "playback" session hears nothing from the mic. Rebuild it in "play-and-record".
+      const as=navigator.audioSession;
+      if(as&&Audio.ctx&&as.type!=="play-and-record"){ Audio.stopAll(); try{ Audio.ctx.onstatechange=null; Audio.ctx.close(); }catch(e){} Audio.ctx=null; Audio.live.clear(); Audio.liveT.clear(); }
+      try{ if(as) as.type="play-and-record"; }catch(e){}
       const ctx=Audio.ensure();
-      try{ if(navigator.audioSession) navigator.audioSession.type="play-and-record"; }catch(e){}
       const s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
-      this.stream=s; const src=ctx.createMediaStreamSource(s);
+      this.stream=s; if(ctx.state!=="running") await ctx.resume().catch(()=>{});
+      const src=this.src=ctx.createMediaStreamSource(s);
       this.an=ctx.createAnalyser(); this.an.fftSize=2048;
       this.an2=ctx.createAnalyser(); this.an2.fftSize=8192; this.an2.smoothingTimeConstant=0;
-      src.connect(this.an); src.connect(this.an2);
+      // Safari only feeds analysers that lead to the destination: route them there through a muted gain.
+      const mute=this.mute=ctx.createGain(); mute.gain.value=0; mute.connect(ctx.destination);
+      src.connect(this.an); src.connect(this.an2); this.an.connect(mute); this.an2.connect(mute);
+      // iOS cuts the microphone when the app goes to the background: start again on return.
+      s.getAudioTracks().forEach(t=>{ t.onended=()=>{ if(this.stream!==s) return; this.stop(); this.resume=true; }; });
       this.buf=new Float32Array(2048); this.spec=new Float32Array(4096);
       this.on=true; this.err=null; this.timer=setInterval(()=>this.tick(),25); this.notify(); return true;
     }catch(e){ this.err=(e&&e.name)||"error"; this.notify(); return false; }
   },
-  stop(){ clearInterval(this.timer); if(this.stream) this.stream.getTracks().forEach(t=>t.stop()); this.stream=null; this.on=false; this.heard=null;
+  stop(){ clearInterval(this.timer); const s=this.stream; this.stream=null; if(s) s.getTracks().forEach(t=>t.stop());
+    try{ this.src&&this.src.disconnect(); this.mute&&this.mute.disconnect(); }catch(e){} this.src=this.mute=null; this.on=false; this.heard=null; this.level=0;
     try{ if(navigator.audioSession) navigator.audioSession.type="playback"; }catch(e){} this.notify(); },
   tick(){
     const ctx=Audio.ctx, buf=this.buf; this.an.getFloatTimeDomainData(buf);
@@ -526,14 +541,16 @@ const Mic={
     this.heard=mm; this.notify();
     if(kb.keys.has(mm)) kb.virtual(mm,{t,mic:true});
   },
-  meter(){ const v=Math.min(1,Math.sqrt(this.level)*4); document.querySelectorAll(".mic-lv").forEach(e=>{ e.style.transform=`scaleX(${v})`; }); },
+  meter(){ const v=Math.min(1,Math.sqrt(this.level)*4); document.querySelectorAll(".mic-lv").forEach(e=>{ e.style.transform=`scaleX(${v})`; });
+    const d=document.querySelector(".mic-diag"); if(d) d.textContent=micDiag(); },
   notify(){ document.querySelectorAll("[data-mic]").forEach(paintMic); }
 };
 const MIC_SVG='<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor"/><path d="M6 11a6 6 0 0 0 12 0M12 17v4M9 21h6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>';
 function micButton(){ const b=h("button",{class:"mic-btn","data-mic":"",onclick:()=>toggleMic()}); paintMic(b); return b; }
 function paintMic(b){
   b.classList.toggle("on",Mic.on); b.classList.toggle("err",!Mic.on&&!!Mic.err);
-  const label=Mic.on?(Mic.heard!=null?`J'entends : ${keyName(Mic.heard)}`:"J'écoute ton piano"):(Mic.err?"Micro indisponible":"Piano réel");
+  const asleep=Mic.on&&Audio.ctx&&Audio.ctx.state!=="running";
+  const label=asleep?"Touche l'écran pour réveiller le micro":Mic.on?(Mic.heard!=null?`J'entends : ${keyName(Mic.heard)}`:"J'écoute ton piano"):(Mic.err?"Micro indisponible":"Piano réel");
   b.innerHTML=MIC_SVG+`<span class="mic-t">${label}</span>`+(Mic.on?'<span class="mic-lvw"><i class="mic-lv"></i></span>':"");
   b.setAttribute("aria-pressed",Mic.on?"true":"false");
 }
@@ -541,7 +558,12 @@ async function toggleMic(){
   if(Mic.on){ Mic.stop(); P.settings.mic=false; Store.save(); return; }
   const ok=await Mic.start(); P.settings.mic=ok; Store.save();
   if(ok) toast("Micro activé. Joue sur ton piano : les notes entendues s'allument sur le clavier.");
-  else toast(Mic.err==="NotAllowedError"&&!window.claude?"Accès au micro refusé. Autorise-le dans Réglages › Safari › Micro, puis réessaie.":"Le micro n'est pas accessible ici. Ouvre la version installée de l'atelier : explications dans Réglages.",6000);
+  else toast(window.claude?"Le micro n'est pas accessible dans Claude. Ouvre la version installée de l'atelier.":Mic.err==="NotAllowedError"?"Accès au micro refusé. Sur l'iPad : Réglages › Safari › Micro › Autoriser (ou Demander), puis rouvre l'atelier.":`Le micro n'a pas pu démarrer (${Mic.err}). Ferme l'atelier complètement et rouvre-le.`,7000);
+}
+function micDiag(){
+  if(!Mic.on) return Mic.err?`Micro arrêté · erreur : ${Mic.err}`:"Micro arrêté";
+  const c=Audio.ctx, lv=Math.round(Math.min(1,Math.sqrt(Mic.level)*4)*100);
+  return `Son : ${c?c.state:"?"} · ${c?Math.round(c.sampleRate/100)/10:"?"} kHz · niveau ${lv} %`+(Mic.heard!=null?` · dernière note : ${keyName(Mic.heard)}`:" · aucune note reconnue");
 }
 function toast(msg,ms=3800){ const t=h("div",{class:"toast",role:"status"},msg); document.body.append(t); setTimeout(()=>t.remove(),ms); }
 
@@ -1571,7 +1593,7 @@ function settingsTab(){
           h("button",{class:"btn",onclick:()=>{ const t=Audio.ensure().currentTime+.05; [60,64,67,72].forEach((m,i)=>Audio.play(m,t+i*.12,1.4)); }},"Tester le son"))),
       h("div",{class:"set-row"},h("div",{class:"lbl"},h("b",{},"Piano réel (micro)"),
           h("span",{},window.claude?"Dans Claude, l'accès au micro est bloqué. Pour que l'atelier entende ton piano, ouvre la version installée (lien que je t'ai donné). Elle fonctionne exactement pareil.":"L'iPad écoute ton piano et reconnaît les notes jouées. Pose l'iPad près du piano, dans une pièce calme. Une note à la fois marche le mieux ; les accords sont vérifiés note par note.")),
-        h("div",{style:"display:flex;gap:10px;align-items:center;flex-wrap:wrap"},micButton(),
+        h("div",{style:"display:flex;gap:10px;align-items:center;flex-wrap:wrap"},micButton(),h("span",{class:"mic-diag","aria-live":"off"},micDiag()),
           h("label",{style:"display:flex;gap:8px;align-items:center;color:var(--muted);font-size:14px"},"Sensibilité",h("input",{type:"range",id:"micsens",min:0,max:1,step:.05,value:Mic.sens(),oninput:e=>{ P.settings.micSens=+e.target.value; },onchange:()=>Store.save()})))),
       h("div",{class:"set-row transfer"},h("div",{class:"lbl",style:"flex:1;min-width:240px"},h("b",{},"Transférer ma progression"),
           h("span",{},"Pour passer d'une version de l'atelier à l'autre : copie le code ici, puis colle-le dans l'autre version."),
@@ -1594,8 +1616,16 @@ function transferBox(){
 /* ================= practice time ================= */
 setInterval(()=>{ if(onHome||document.hidden||Date.now()-lastInteract>45000) return; today().s+=5; Store.saveLocal(); },5000);
 setInterval(()=>{ if(!onHome&&!document.hidden&&Date.now()-lastInteract<60000) Store.save(); },30000);
-document.addEventListener("pointerdown",markInteract,true);
-document.addEventListener("visibilitychange",()=>{ if(document.hidden) Store.save(); });
+document.addEventListener("pointerdown",()=>{ markInteract(); if(Audio.ctx&&Audio.ctx.state!=="running") Audio.ctx.resume().then(()=>Mic.notify(),()=>{}); },true);
+document.addEventListener("visibilitychange",()=>{ if(document.hidden){ Store.save(); return; }
+  if(Audio.ctx&&Audio.ctx.state!=="running") Audio.ctx.resume().catch(()=>{});
+  if(Mic.resume&&P.settings.mic&&!Mic.on){ Mic.resume=false; Mic.start(); } });
+/* No zoom: iOS ignores user-scalable, so block pinch and double-tap here (not on the keyboard, the pad or form fields). */
+["gesturestart","gesturechange"].forEach(t=>document.addEventListener(t,e=>e.preventDefault(),{passive:false}));
+document.addEventListener("dblclick",e=>e.preventDefault(),{passive:false});
+let lastTouchEnd=0;
+document.addEventListener("touchend",e=>{ const now=Date.now(), quick=now-lastTouchEnd<350; lastTouchEnd=now;
+  if(quick&&e.cancelable&&!(e.target.closest&&e.target.closest("button,input,textarea,select,.kb,.pad"))) e.preventDefault(); },{passive:false});
 
 renderHome();
 Store.init();

@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 mkdir -p web
 {
   printf '%s\n' '<!doctype html><html lang="fr"><head><meta charset="utf-8">'
-  printf '%s\n' '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+  printf '%s\n' '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">'
   printf '%s\n' '<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">'
   printf '%s\n' '<meta name="apple-mobile-web-app-status-bar-style" content="black">'
   printf '%s\n' '<meta name="apple-mobile-web-app-title" content="Atelier Piano"><meta name="theme-color" content="#191A20">'
