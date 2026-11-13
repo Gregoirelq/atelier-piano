@@ -451,26 +451,35 @@ const Audio={
   }
 };
 
-/* ================= microphone: hearing a real piano ================= */
-// YIN pitch estimate on one frame. Returns {f, c} (frequency, clarity 0..1) or null.
-function yin(buf,sr){
-  const half=buf.length>>1, d=new Float32Array(half);
-  const minTau=Math.floor(sr/2200), maxTau=Math.min(half-2,Math.ceil(sr/58));
-  for(let tau=1;tau<=maxTau;tau++){ let s=0; for(let i=0;i<half;i++){ const x=buf[i]-buf[i+tau]; s+=x*x; } d[tau]=s; }
-  let run=0; d[0]=1;
-  for(let tau=1;tau<=maxTau;tau++){ run+=d[tau]; d[tau]=run?d[tau]*tau/run:1; }
-  let tau=-1;
-  for(let t=minTau;t<maxTau;t++){ if(d[t]<.18){ while(t+1<maxTau&&d[t+1]<d[t]) t++; tau=t; break; } }
-  if(tau<2) return null;
-  const a=d[tau-1], b=d[tau], c=d[tau+1], den=2*(2*b-c-a);
-  const bt=den?tau+(c-a)/den:tau;
-  return {f:sr/bt,c:1-b};
-}
+/* ================= microphone: hearing a real piano =================
+   Built for speed, in two stages.
+   1. Attacks: an AudioWorklet looks at every 256 samples (5 ms) for the hammer's attack and timestamps it to the
+      sample. Without AudioWorklet, the same test runs on the main thread every 15 ms.
+   2. Notes: 50 ms after each attack, the spectrum is compared with the one taken just before it. Only partials that
+      got louder count, so a note still ringing is ignored and fast, repeated or overlapping notes are all caught.
+      Every key is scored on its first six partials; chords come out note by note. The notes the lesson expects get a
+      head start, a wrong note must be clear-cut to count. Low notes get a second, finer look at 100 ms. */
+const ONSET_WORKLET=`class OnsetProc extends AudioWorkletProcessor{
+constructor(){super();this.hop=256;this.n=0;this.hp=0;this.lv=0;this.prev=0;this.H=[];this.L=[];this.last=-1;this.m=0;this.g={hp:2e-6,lv:1.6e-5,r:2.6};
+this.port.onmessage=e=>{Object.assign(this.g,e.data);};}
+process(inp){const x=inp[0]&&inp[0][0];if(!x)return true;
+for(let i=0;i<x.length;i++){const v=x[i],d=v-this.prev;this.prev=v;this.hp+=d*d;this.lv+=v*v;
+if(++this.n<this.hop)continue;
+const hp=this.hp/this.n,lv=this.lv/this.n,t=currentTime+(i+1-this.n)/sampleRate,g=this.g;this.n=0;this.hp=0;this.lv=0;
+let rh=0,rl=0;for(let k=0;k<this.H.length;k++){rh+=this.H[k];rl+=this.L[k];}if(this.H.length){rh/=this.H.length;rl/=this.L.length;}
+if(t-this.last>0.045&&((hp>g.hp&&hp>g.r*rh)||(lv>g.lv&&lv>g.r*rl))){this.last=t;this.port.postMessage({on:t});}
+this.H.push(hp);this.L.push(lv);if(this.H.length>6){this.H.shift();this.L.shift();}
+if(++this.m>=8){this.m=0;this.port.postMessage({lv});}}
+return true;}}
+registerProcessor("onset-proc",OnsetProc);`;
+const PARTIAL_W=[1,.9,.7,.5,.4,.3];
 const Mic={
-  on:false, err:null, kb:null, onOnset:null, heard:null, level:0,
-  hist:[], lastOnset:0, armed:false, current:null, cand:null, candN:0,
+  on:false, err:null, kb:null, onOnset:null, heard:null, level:0, resume:false,
+  snaps:[], scores:new Map(), lastOnset:-1, emitted:new Map(), fb:{H:[],L:[],last:-1}, nTick:0,
   supported(){ return !!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia); },
   sens(){ return P.settings.micSens!=null?P.settings.micSens:.6; },
+  thresholds(){ const s=this.sens(); return {hp:2e-7*Math.pow(10,(1-s)*2.5),lv:1e-6*Math.pow(10,(1-s)*3),r:1.8+(1-s)*1.5}; },
+  tune(){ if(this.node) this.node.port.postMessage(this.thresholds()); },
   async start(){
     if(this.on) return true;
     if(!this.supported()){ this.err="unsupported"; this.notify(); return false; }
@@ -483,73 +492,112 @@ const Mic={
       const s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
       this.stream=s; if(ctx.state!=="running") await ctx.resume().catch(()=>{});
       const src=this.src=ctx.createMediaStreamSource(s);
-      this.an=ctx.createAnalyser(); this.an.fftSize=2048;
-      this.an2=ctx.createAnalyser(); this.an2.fftSize=8192; this.an2.smoothingTimeConstant=0;
-      // Safari only feeds analysers that lead to the destination: route them there through a muted gain.
+      this.an=ctx.createAnalyser(); this.an.fftSize=2048; this.an.smoothingTimeConstant=0;
+      this.an2=ctx.createAnalyser(); this.an2.fftSize=4096; this.an2.smoothingTimeConstant=0;
+      // Safari only feeds nodes that lead to the destination: route them there through a muted gain.
       const mute=this.mute=ctx.createGain(); mute.gain.value=0; mute.connect(ctx.destination);
       src.connect(this.an); src.connect(this.an2); this.an.connect(mute); this.an2.connect(mute);
+      this.f1=new Float32Array(1024); this.f2=new Float32Array(2048); this.td=new Float32Array(2048);
+      this.node=null;
+      try{
+        if(ctx.audioWorklet&&window.AudioWorkletNode){
+          if(!ctx._onset) ctx._onset=ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([ONSET_WORKLET],{type:"application/javascript"})));
+          await ctx._onset;
+          const node=this.node=new AudioWorkletNode(ctx,"onset-proc",{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});
+          node.port.onmessage=e=>{ const d=e.data; if(d.lv!=null) this.level=Math.sqrt(d.lv); if(d.on!=null) this.onset(d.on); };
+          src.connect(node); node.connect(mute); this.tune();
+        }
+      }catch(e){ this.node=null; }
       // iOS cuts the microphone when the app goes to the background: start again on return.
       s.getAudioTracks().forEach(t=>{ t.onended=()=>{ if(this.stream!==s) return; this.stop(); this.resume=true; }; });
-      this.buf=new Float32Array(2048); this.spec=new Float32Array(4096);
-      this.on=true; this.err=null; this.timer=setInterval(()=>this.tick(),25); this.notify(); return true;
+      this.snaps=[]; this.emitted=new Map(); this.fb={H:[],L:[],last:-1};
+      this.on=true; this.err=null; this.timer=setInterval(()=>this.tick(),15); this.notify(); return true;
     }catch(e){ this.err=(e&&e.name)||"error"; this.notify(); return false; }
   },
   stop(){ clearInterval(this.timer); const s=this.stream; this.stream=null; if(s) s.getTracks().forEach(t=>t.stop());
-    try{ this.src&&this.src.disconnect(); this.mute&&this.mute.disconnect(); }catch(e){} this.src=this.mute=null; this.on=false; this.heard=null; this.level=0;
+    try{ if(this.node){ this.node.port.onmessage=null; this.node.disconnect(); } this.src&&this.src.disconnect(); this.mute&&this.mute.disconnect(); }catch(e){}
+    this.node=this.src=this.mute=null; this.on=false; this.heard=null; this.level=0;
     try{ if(navigator.audioSession) navigator.audioSession.type="playback"; }catch(e){} this.notify(); },
+  // Every 15 ms: keep the last spectra (the "before" pictures), and catch attacks if there is no worklet.
   tick(){
-    const ctx=Audio.ctx, buf=this.buf; this.an.getFloatTimeDomainData(buf);
-    let s=0; for(let i=0;i<buf.length;i++) s+=buf[i]*buf[i];
-    const rms=Math.sqrt(s/buf.length), now=ctx.currentTime, gate=.002+.03*Math.pow(1-this.sens(),2);
-    this.level=rms; this.hist.push(rms); if(this.hist.length>8) this.hist.shift();
-    const mn=Math.min(...this.hist.slice(0,-1));
-    if(rms>gate&&rms>mn*1.7&&now-this.lastOnset>.09){ this.lastOnset=now; this.armed=true; this.hist=[rms]; this.chordDone=false; this.emittedSinceOnset=false; this.cand=null; this.candN=0; if(this.onOnset&&!Audio.clickNear(now-.03)) this.onOnset(now-.03); }
-    if(rms<gate*.7){ this.current=null; this.cand=null; this.candN=0; }
-    else { const r=yin(buf,ctx.sampleRate);
-      if(r&&r.c>.82&&r.f>60&&r.f<2100){ const m=Math.round(69+12*Math.log2(r.f/440));
-        if(m===this.cand) this.candN++; else { this.cand=m; this.candN=1; }
-        const octaveSlip=!this.armed&&this.current!=null&&Math.abs(m-this.current)%12===0;
-        if(this.candN>=2&&now-this.lastOnset>.04&&!octaveSlip&&(this.armed||m!==this.current)){ this.current=m; const t=this.armed?this.lastOnset:now-.06; this.armed=false; this.emit(m,t); } } }
-    if(!this.chordDone&&rms>gate&&now-this.lastOnset>.12){ this.chordDone=true; this.chordCheck(); }
+    const ctx=Audio.ctx; if(!ctx||!this.an) return; const now=ctx.currentTime;
+    this.an.getFloatFrequencyData(this.f1); this.an2.getFloatFrequencyData(this.f2);
+    this.snaps.push({t:now,a:this.f1.slice(),b:this.f2.slice()}); if(this.snaps.length>16) this.snaps.shift();
+    if(!this.node) this.mainOnset(now);
+    // Soft legato can slip in without a clear attack: every 60 ms, look for an expected note that has just appeared.
+    if(++this.nTick%4===0&&now-this.lastOnset>.12&&this.level>.002){ const b=this.snaps.find(s=>s.t>=now-.075); if(b&&b.t<now-.04) this.analyze(now-.03,b,1,true); }
     this.meter();
   },
-  // Spectral peaks (Hz) of the current frame, refreshed at most once per tick.
-  peaks(){
-    const now=Audio.ctx.currentTime; if(this.pk&&now-this.pkT<.02) return this.pk;
-    this.an2.getFloatFrequencyData(this.spec); const sp=this.spec, bin=Audio.ctx.sampleRate/8192;
-    let mx=-300; for(let k=8;k<1500;k++) if(sp[k]>mx) mx=sp[k];
-    const thr=Math.max(mx-38,-90), out=[];
-    for(let k=12;k<1500;k++){ const b=sp[k]; if(b<thr||b<sp[k-1]||b<=sp[k+1]) continue;
-      let t=0; for(let i=8;i<=12;i++) t+=sp[k-i]+sp[k+i]; if(b-t/10<10) continue;
-      const a=sp[k-1], c=sp[k+1], den=a-2*b+c; out.push((k+(den?.5*(a-c)/den:0))*bin); }
-    this.pk=out; this.pkT=now; return out;
+  mainOnset(now){
+    this.an.getFloatTimeDomainData(this.td); const sr=Audio.ctx.sampleRate, n=Math.min(this.td.length,Math.round(sr*.015)), x=this.td, o=x.length-n;
+    let hp=0, lv=0; for(let i=o+1;i<x.length;i++){ const d=x[i]-x[i-1]; hp+=d*d; lv+=x[i]*x[i]; } hp/=n; lv/=n; this.level=Math.sqrt(lv);
+    const F=this.fb, g=this.thresholds(), avg=a=>a.length?a.reduce((p,q)=>p+q,0)/a.length:0, t=now-n/sr;
+    if(t-F.last>.045&&((hp>g.hp&&hp>g.r*avg(F.H))||(lv>g.lv&&lv>g.r*avg(F.L)))){ F.last=t; this.onset(t); }
+    F.H.push(hp); F.L.push(lv); if(F.H.length>2){ F.H.shift(); F.L.shift(); }
   },
-  // Is note m sounding right now? Fundamental, or 2nd and 3rd harmonics when the fundamental is weak (bass).
-  has(m){
-    if(!this.on) return false; const ps=this.peaks(), f=440*Math.pow(2,(m-69)/12);
-    const near=x=>ps.some(p=>Math.abs(1200*Math.log2(p/x))<40);
-    return near(f)||(near(2*f)&&near(3*f));
+  onset(t){
+    const ctx=Audio.ctx; if(!ctx||Audio.clickNear(t)) return;
+    this.lastOnset=t;
+    if(this.onOnset) this.onOnset(t);
+    let before=null; for(let i=this.snaps.length-1;i>=0;i--) if(this.snaps[i].t<=t-.002){ before=this.snaps[i]; break; }
+    setTimeout(()=>this.analyze(t,before,1),Math.max(0,(t+.05-ctx.currentTime)*1000));
   },
-  // Shortly after an attack: confirm chords (and missed single notes) against what the lesson expects.
-  chordCheck(){
-    const kb=this.kb; if(!kb||!kb.expect) return;
-    const exp=[...new Set(kb.expect())].filter(x=>kb.keys.has(x)&&!Audio.appSounding(x)); if(!exp.length) return;
-    if(exp.length===1&&this.emittedSinceOnset) return;
-    const present=exp.filter(x=>this.has(x));
-    if(present.length!==exp.length) return;
-    const before=kb.expect().join();
-    for(const x of present){ if(kb.expect().join()!==before) break; if(x===this.lastEmit&&this.emittedSinceOnset) continue; this.heard=x; kb.virtual(x,{t:this.lastOnset,mic:true}); }
-    this.notify();
+  // Score every key against the partials that got louder since `before`. pass 1: 2048-point FFT, pass 2: 4096 (bass).
+  analyze(t,before,pass,quiet,skip){
+    const ctx=Audio.ctx; if(!this.on||!ctx) return;
+    const big=pass===2, an=big?this.an2:this.an, spec=big?this.f2:this.f1; an.getFloatFrequencyData(spec);
+    const prev=before?(big?before.b:before.a):null, sr=ctx.sampleRate, bin=sr/an.fftSize, K=spec.length, d=new Float32Array(K);
+    let mx=0;
+    for(let k=1;k<K;k++){ const a=Math.pow(10,spec[k]/20), b=prev?Math.pow(10,prev[k]/20):0, v=a-b*1.05; d[k]=v>0?v:0; const f=k*bin; if(f>50&&f<5000&&d[k]>mx) mx=d[k]; }
+    if(mx<2e-5) return;
+    const kb=this.kb, exp=new Set(kb&&kb.expect?kb.expect():[]);
+    // Each partial is weighed against the note's own strongest partial (so a re-struck note, which only gets louder,
+    // keeps its full shape), then the whole note against the loudest change in the frame (-40 dB counts for nothing).
+    const score=(m,dd)=>{ const f=440*Math.pow(2,(m-69)/12), ps=[];
+      for(let h=1;h<=6;h++){ const fh=f*h; if(fh>Math.min(6000,sr*.45)) break;
+        // the partial must be a real peak, and its interpolated frequency must land within a third of a semitone
+        const c=fh/bin; let p=0;
+        for(let k=Math.max(2,Math.floor(c-1.5));k<=Math.min(K-2,Math.ceil(c+1.5));k++){ const v=dd[k]; if(v<=p||v<dd[k-1]||v<dd[k+1]) continue;
+          const den=dd[k-1]-2*v+dd[k+1], fk=(k+(den?.5*(dd[k-1]-dd[k+1])/den:0))*bin, ce=Math.abs(1200*Math.log2(fk/fh));
+          if(ce<(h>2?45:35)) p=v; }
+        ps.push(p); }
+      const pm=Math.max(0,...ps); if(pm<=0) return {m,s:0,hits:0,odd:0,q12:0};
+      const g=clamp(1+20*Math.log10(pm/mx)/40,0,1); let s=0, ws=0, hits=0, odd=0, q12=0;
+      ps.forEach((p,i)=>{ const q=p>0?clamp(1+20*Math.log10(p/pm)/30,0,1):0, w=PARTIAL_W[i]; s+=w*q; ws+=w; if(q>.15) hits++; if(i===2||i===4) odd+=q/2; if(i<=1&&q>q12) q12=q; });
+      return {m,s:ws?g*s/ws:0,hits,odd,q12,g,ps}; };
+    const lo=big?28:33, hi=big?66:100, picked=[], res=d.slice();
+    let deferBass=false;
+    // 1. The notes the lesson expects, each tested on its own: chord notes share partials, so nothing is subtracted.
+    for(const m of exp){ if(skip&&skip.has(m)) continue; if(quiet&&this.emitted.has(m)&&t-this.emitted.get(m)<.25) continue;
+      const r=score(m,d); if(r.s>=(quiet?.6:.5)&&r.q12>.3) picked.push(m); else if(pass!==2&&!quiet&&m<60) deferBass=true; }
+    // 2. Nothing expected was heard: free play, or a wrong note. Strongest note first, remove its partials, look again.
+    if(!picked.length&&!quiet) for(let round=0;round<4;round++){
+      let best=null;
+      for(let m=lo;m<=hi;m++){ if(picked.includes(m)||(skip&&skip.has(m))) continue; const r=score(m,res); if(!best||r.s>best.s) best=r; }
+      if(!best) break;
+      // a note whose fundamental is weak can pass for its octave above: prefer the lower one when it explains more
+      const low=score(best.m-12,res); if(!picked.includes(low.m)&&((low.s>=.55&&low.odd>.3&&low.s>=best.s*.75)||(low.hits>best.hits&&low.s>=best.s*.7))) best=low;
+      if(best.s<(exp.size?.62:(picked.length?.5:.45))||best.hits<3) break;
+      // below middle C, or possibly a partial of a lower note: wait for the finer 4096-point look
+      if((pass===1||pass===3)&&(best.m<60||[12,19,24].some(k=>score(best.m-k,res).s>=best.s*.6))){ deferBass=true; break; }
+      picked.push(best.m);
+      const f=440*Math.pow(2,(best.m-69)/12); for(let h=1;h<=8;h++){ const c=f*h/bin; for(let k=Math.max(1,Math.floor(c-1.5));k<=Math.min(K-1,Math.ceil(c+1.5));k++) res[k]=0; }
+    }
+    if(this.debug&&!quiet){ const all=[]; for(let m=lo;m<=hi;m++){ const r=score(m,d); all.push(r); } all.sort((a,b)=>b.s-a.s); this.debug.push({t:+t.toFixed(3),pass,exp:[...exp],picked:[...picked],top:all.slice(0,2).map(r=>noteStr(r.m)+" "+r.s.toFixed(2)+"/"+r.hits+" g"+(r.g||0).toFixed(2)+" ["+(r.ps||[]).map(x=>(20*Math.log10(x/mx||1e-9)).toFixed(0))+"]")}); }
+    if(!quiet){ this.scores=new Map(); for(let m=36;m<=96;m++) this.scores.set(m,score(m,d).s); this.scoresT=t; }
+    if((pass===1||pass===3)&&deferBass) setTimeout(()=>this.analyze(t,before,2,false,new Set(picked)),Math.max(0,(t+.1-ctx.currentTime)*1000));
+    // nothing yet: look once more 35 ms later, when the previous note has faded a little, unless a new attack came in
+    else if(pass===1&&!quiet&&!picked.length) setTimeout(()=>{ if(this.lastOnset===t) this.analyze(t,before,3); },Math.max(0,(t+.085-ctx.currentTime)*1000));
+    for(const m of picked) this.emit(m,t);
   },
   emit(m,t){
-    if(m===this.lastEmit&&t-this.lastEmitT<.15) return; this.lastEmit=m; this.lastEmitT=t; this.emittedSinceOnset=true;
-    const kb=this.kb; if(!kb||Audio.appSounding(m)) return;
-    let mm=m; const exp=kb.expect?kb.expect():null;
-    if(exp&&exp.length>1&&!exp.includes(m)) return; // single-pitch tracking is unreliable on chords: chordCheck decides
-    if(exp&&exp.length&&!exp.includes(m)){ const alt=exp.find(x=>Math.abs(x-m)===12||Math.abs(x-m)===24); if(alt!=null&&this.has(alt)) mm=alt; }
-    this.heard=mm; this.notify();
-    if(kb.keys.has(mm)) kb.virtual(mm,{t,mic:true});
+    const last=this.emitted.get(m); if(last!=null&&Math.abs(t-last)<.07) return; this.emitted.set(m,t);
+    if(Audio.appSounding(m)) return;
+    this.heard=m; this.notify();
+    const kb=this.kb; if(kb&&kb.keys.has(m)) kb.virtual(m,{t,mic:true});
   },
+  // Is note m sounding in the latest analysis? Used to complete chords.
+  has(m){ return this.on&&(this.scores.get(m)||0)>=.25&&Audio.ctx&&Audio.ctx.currentTime-(this.scoresT||0)<.4; },
   meter(){ const v=Math.min(1,Math.sqrt(this.level)*4); document.querySelectorAll(".mic-lv").forEach(e=>{ e.style.transform=`scaleX(${v})`; });
     const d=document.querySelector(".mic-diag"); if(d) d.textContent=micDiag(); },
   notify(){ document.querySelectorAll("[data-mic]").forEach(paintMic); }
@@ -1601,9 +1649,9 @@ function settingsTab(){
         h("div",{style:"display:flex;gap:10px;align-items:center"},h("input",{type:"range",id:"vol",min:0,max:1,step:.05,value:P.settings.volume,oninput:e=>{ P.settings.volume=+e.target.value; Audio.setVolume(P.settings.volume); },onchange:()=>Store.save()}),
           h("button",{class:"btn",onclick:()=>{ const t=Audio.ensure().currentTime+.05; [60,64,67,72].forEach((m,i)=>Audio.play(m,t+i*.12,1.4)); }},"Tester le son"))),
       h("div",{class:"set-row"},h("div",{class:"lbl"},h("b",{},"Piano réel (micro)"),
-          h("span",{},window.claude?"Dans Claude, l'accès au micro est bloqué. Pour que l'atelier entende ton piano, ouvre la version installée (lien que je t'ai donné). Elle fonctionne exactement pareil.":"L'iPad écoute ton piano et reconnaît les notes jouées. Pose l'iPad près du piano, dans une pièce calme. Une note à la fois marche le mieux ; les accords sont vérifiés note par note.")),
+          h("span",{},window.claude?"Dans Claude, l'accès au micro est bloqué. Pour que l'atelier entende ton piano, ouvre la version installée (lien que je t'ai donné). Elle fonctionne exactement pareil.":"L'iPad écoute ton piano et reconnaît les notes jouées. Pose l'iPad près du piano, dans une pièce calme. Les notes rapides, répétées et les accords sont reconnus. Si des notes passent inaperçues, monte la sensibilité ; si des notes fantômes apparaissent, baisse-la.")),
         h("div",{style:"display:flex;gap:10px;align-items:center;flex-wrap:wrap"},micButton(),h("span",{class:"mic-diag","aria-live":"off"},micDiag()),
-          h("label",{style:"display:flex;gap:8px;align-items:center;color:var(--muted);font-size:14px"},"Sensibilité",h("input",{type:"range",id:"micsens",min:0,max:1,step:.05,value:Mic.sens(),oninput:e=>{ P.settings.micSens=+e.target.value; },onchange:()=>Store.save()})))),
+          h("label",{style:"display:flex;gap:8px;align-items:center;color:var(--muted);font-size:14px"},"Sensibilité",h("input",{type:"range",id:"micsens",min:0,max:1,step:.05,value:Mic.sens(),oninput:e=>{ P.settings.micSens=+e.target.value; Mic.tune(); },onchange:()=>Store.save()})))),
       h("div",{class:"set-row transfer"},h("div",{class:"lbl",style:"flex:1;min-width:240px"},h("b",{},"Transférer ma progression"),
           h("span",{},"Pour passer d'une version de l'atelier à l'autre : copie le code ici, puis colle-le dans l'autre version."),
           transferBox())),
